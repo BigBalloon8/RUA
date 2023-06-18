@@ -1,20 +1,26 @@
 from transformers import BertModel
 import transformers
+from peft import get_peft_model, LoraConfig, TaskType
 import torch
 import torch.nn as nn
 import math
 
 #bert_base = BertModel.from_pretrained("bert-base-uncased", add_pooling_layer = False)
 
-class encoder(nn.Module):
-    def __init__(self):
+class bert_encoder_module(nn.Module):
+    def __init__(self, decoder_sequence_length=1024):
         """
         The same bert and linear layers act on all 100 short-term sequences
         """
         super().__init__()
+        self.decoder_sequence_factor = decoder_sequence_length/512
+        if self.decoder_sequence_factor % 1.0 == 0.0:
+            raise ValueError("decoder_sequence_factor must be a multiple of 512(bert sequence length)")
         self.bert_base = BertModel.from_pretrained("bert-base-uncased", add_pooling_layer = False)
+        peft_config = LoraConfig(task_type=TaskType.QUESTION_ANS, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1)
+        self.bert_base = get_peft_model(self.bert_base, peft_config)
         self.linear_in = nn.Linear(768, 2048)
-        self.linear_out = nn.Linear(2048, 768*4)
+        self.linear_out = nn.Linear(2048, int(768*self.decoder_sequence_factor) + 768*2)
 
 
     def forward(self, input_ids, attention_mask, token_type_ids):
@@ -25,8 +31,9 @@ class encoder(nn.Module):
 
         x = torch.vmap(lambda a, b, c, : self.bert_base(input_ids=a, attention_mask=b, token_type_ids=c)["last_hidden_state"], in_dims=1, out_dims=1)(input_ids, attention_mask, token_type_ids)
         x = torch.vmap(lambda a: torch.vmap(lambda input: self.linear_out(self.linear_in(input)),in_dims=1, out_dims=1)(a))(x)
-        x1,x2 = torch.chunk(x, 2, dim=3)
-        x = torch.cat((x1,x2), dim=2)
+        print(x.shape)
+        chunks = torch.chunk(x, int(self.decoder_sequence_factor), dim=3)
+        x = torch.cat(chunks, dim=2)
         return x
 
 class decoder_embedder(nn.Module):
@@ -105,38 +112,41 @@ class compress_module(nn.Module):
     def __init__(self):
         super().__init__()
         self.Q_up = nn.Linear(768*2, 2048)
+        self.Q_int = nn.Linear(2048, 2048)
         self.Q_down = nn.Linear(2048, 768)
+
         self.KV_up = nn.Linear(768*2, 2048)
+        self.KV_int = nn.Linear(2048, 2048)
         self.KV_down = nn.Linear(2048, 768)
     
     def forward(self, x, K, V):
         x1,x2 = torch.tensor_split(x, 2, dim=1)
         x = torch.cat((x1,x2), dim=-1)
-        x = torch.vmap(lambda a: torch.vmap(lambda input: self.Q_down(self.Q_up(input)),in_dims=1, out_dims=1)(a))(x)
+        x = torch.vmap(lambda a: torch.vmap(lambda input: self.Q_down(self.Q_int(self.Q_up(input))),in_dims=1, out_dims=1)(a))(x)
 
         K1,K2 = torch.tensor_split(K, 2, dim=1)
         K = torch.cat((K1,K2), dim=-1)
-        K = torch.vmap(lambda a: torch.vmap(lambda input: self.KV_down(self.KV_up(input)),in_dims=1, out_dims=1)(a))(K)
+        K = torch.vmap(lambda a: torch.vmap(lambda input: self.KV_down(self.KV_int(self.KV_up(input))),in_dims=1, out_dims=1)(a))(K)
 
         V1,V2 = torch.tensor_split(V, 2, dim=1)
         V = torch.cat((V1,V2), dim=-1)
-        V = torch.vmap(lambda a: torch.vmap(lambda input: self.KV_down(self.KV_up(input)),in_dims=1, out_dims=1)(a))(V)
-
+        V = torch.vmap(lambda a: torch.vmap(lambda input: self.KV_down(self.KV_int(self.KV_up(input))),in_dims=1, out_dims=1)(a))(V)
+        
         return x , K, V
 
 
 class RUA(nn.Module):  # Read, Understand, Answer
-    def __init__(self, num_encoder_seqences = 128, num_final_decoders=1):
+    def __init__(self, num_encoder_sequences = 128, num_final_decoders=1, decoder_sequence_length=1024):
         super().__init__()
 
         config = transformers.BertConfig(vocab_size = 30522, hidden_size = 768 ,intermediate_size = 3072, max_position_embeddings = 1024, type_vocab_size = 2)
         bert = BertModel(config)
         self.embed = bert.embeddings
 
-        self.encoder = encoder()
+        self.encoder = bert_encoder_module(decoder_sequence_length=decoder_sequence_length)
         self.decoder_Q = initial_decoder_module()
         self.decoder_intermediate = decoder_module()
-        self.compressed_decoders = nn.ModuleList([decoder_module() for _ in range(int(math.log(num_encoder_seqences)))])
+        self.compressed_decoders = nn.ModuleList([decoder_module() for _ in range(int(math.log2(num_encoder_sequences)))])
         self.compress = compress_module()
         self.final_decoders = nn.ModuleList([decoder_module() for _ in range(num_final_decoders)])#decoder_module()
     
